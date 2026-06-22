@@ -1,0 +1,50 @@
+version: "3.9"
+
+# Local development infrastructure for Distributed Cron Scheduler
+# Start with: docker compose up -d
+# RabbitMQ Management UI: http://localhost:15672  (guest / guest)
+# PostgreSQL:             localhost:5432 / crondb  (cron / cron)
+
+services:
+
+  # ── PostgreSQL 16 ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: cron_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       crondb
+      POSTGRES_USER:     cron
+      POSTGRES_PASSWORD: cron
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cron -d crondb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── RabbitMQ 3 (with Management Plugin) ─────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cron_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management Web UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
