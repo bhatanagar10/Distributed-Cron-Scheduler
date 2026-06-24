@@ -10,8 +10,8 @@ spring:
     driver-class-name: org.postgresql.Driver
     hikari:
       pool-name: CronHikariPool
-      maximum-pool-size: 10
-      minimum-idle: 2
+      maximum-pool-size: 20
+      minimum-idle: 5
       connection-timeout: 30000
       idle-timeout: 600000
 
@@ -27,6 +27,8 @@ spring:
         format_sql: true
         jdbc:
           time_zone: Asia/Kolkata
+          batch_size: 50
+        order_updates: true
 
   # ── Flyway ───────────────────────────────────────────────────────────────────
   flyway:
@@ -43,16 +45,16 @@ spring:
     listener:
       simple:
         acknowledge-mode: auto
-        prefetch: 10               # Each worker pulls up to 10 messages at once
-        concurrency: 2
-        max-concurrency: 5
+        prefetch: 1               # Each worker pulls up to 1 messages at once
+        concurrency: 5
+        max-concurrency: 10
 
 # ── Custom Scheduler Properties ─────────────────────────────────────────────
 scheduler:
   poll-interval-ms: 1000          # How often the Manager polls for due jobs (ms)
   delay-threshold-ms: 2000        # Default drift threshold for /delays endpoint (ms)
   http-timeout-seconds: 30        # Max wait for an HTTP response from the target
-  batch-size: 50                  # Max jobs locked per polling cycle
+  batch-size: 10                  # Max jobs locked per polling cycle
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging:

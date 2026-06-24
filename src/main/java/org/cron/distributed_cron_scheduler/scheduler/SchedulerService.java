@@ -6,6 +6,7 @@ import org.cron.distributed_cron_scheduler.domain.JobDefinition;
 import org.cron.distributed_cron_scheduler.messaging.JobTaskMessage;
 import org.cron.distributed_cron_scheduler.messaging.RabbitMQConfig;
 import org.cron.distributed_cron_scheduler.repository.JobDefinitionRepository;
+import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -14,9 +15,11 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -82,7 +85,7 @@ public class SchedulerService {
      * <p>Uses {@code fixedDelay} (not {@code fixedRate}) so a slow DB cycle never causes
      * overlapping invocations within the same Scheduler instance.
      */
-    @Scheduled(fixedDelayString = "${scheduler.poll-interval-ms:5000}")
+    @Scheduled(fixedRateString = "${scheduler.poll-interval-ms:5000}")
     @Transactional
     public void pollAndDispatch() {
         Instant now = Instant.now();
@@ -97,67 +100,62 @@ public class SchedulerService {
 
         log.info("Scheduler acquired locks on {} due job(s) at {}", dueJobs.size(), now);
 
+        List<JobTaskMessage> messages = new ArrayList<>();
+
         for (JobDefinition job : dueJobs) {
             try {
-                dispatchJob(job, now);
+                // ── 2. Compute next slot (drift-resistant) ───────────────────────────
+                Instant nextRun = nextAnchoredSlot(job, now);
+                job.setNextExecutionTime(nextRun);
+
+                // ── 3. Build the message to be delivered to the Worker ──────────────
+                JobTaskMessage message = JobTaskMessage.builder()
+                        .jobId(job.getId())
+                        .jobName(job.getName())
+                        .targetUrl(job.getTargetUrl())
+                        .httpMethod(job.getHttpMethod())
+                        .scheduledTime(now)          // The "should have fired at" timestamp
+                        .build();
+                
+                messages.add(message);
+
+                log.debug("Dispatched job '{}' (id={}): next run at {} UTC",
+                        job.getName(), job.getId(), nextRun);
             } catch (Exception ex) {
                 // Log per-job failures without aborting the entire batch.
-                // The transaction will still commit for all successfully dispatched jobs.
-                log.error("Failed to dispatch job '{}' (id={}): {}",
+                log.error("Failed to prepare job '{}' (id={}): {}",
                         job.getName(), job.getId(), ex.getMessage(), ex);
             }
         }
-    }
 
-    /**
-     * Advances the job's {@code next_execution_time} using the drift-resistant formula and
-     * schedules a post-commit RabbitMQ publish.
-     *
-     * @param job the due job (already locked in the current transaction)
-     * @param now the timestamp captured at the start of this polling cycle
-     */
-    private void dispatchJob(JobDefinition job, Instant now) {
-
-        // ── 2. Compute next slot (drift-resistant) ───────────────────────────
-        Instant nextRun = nextAnchoredSlot(job, now);
-        job.setNextExecutionTime(nextRun);
-        jobDefinitionRepository.save(job);
-
-        // ── 3. Build the message to be delivered to the Worker ──────────────
-        JobTaskMessage message = JobTaskMessage.builder()
-                .jobId(job.getId())
-                .jobName(job.getName())
-                .targetUrl(job.getTargetUrl())
-                .httpMethod(job.getHttpMethod())
-                .scheduledTime(now)          // The "should have fired at" timestamp
-                .build();
-
-        log.debug("Dispatched job '{}' (id={}): next run at {} UTC",
-                job.getName(), job.getId(), nextRun);
+        // Perform a single batch update for all modified jobs
+        jobDefinitionRepository.saveAll(dueJobs);
 
         // ── 4. Publish to RabbitMQ AFTER the transaction commits ─────────────
-        //
-        // Using afterCommit() guarantees that:
-        //   a) If the DB transaction rolls back → no message is ever sent.
-        //   b) The row lock is released before the broker call → no lock contention.
-        //
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                try {
-                    rabbitTemplate.convertAndSend(
-                            RabbitMQConfig.EXCHANGE_NAME,
-                            RabbitMQConfig.ROUTING_KEY,
-                            message);
-                    log.info("Published job task for '{}' (id={}) to broker",
-                            job.getName(), job.getId());
-                } catch (Exception ex) {
-                    // The DB is already committed; log the miss so it can be investigated.
-                    // The job will execute again at its next anchored slot.
-                    log.error("BROKER PUBLISH FAILED for job '{}' (id={}): {}. "
-                            + "Job will be rescheduled at its next anchored slot.",
-                            job.getName(), job.getId(), ex.getMessage(), ex);
-                }
+                messages.parallelStream().forEach(message -> {
+                    try {
+                        rabbitTemplate.convertAndSend(
+                                RabbitMQConfig.EXCHANGE_NAME,
+                                RabbitMQConfig.ROUTING_KEY,
+                                message,
+                                m -> {
+                                    m.getMessageProperties().setDeliveryMode(MessageDeliveryMode.NON_PERSISTENT);
+                                    return m;
+                                }
+                        );
+                        log.info("Published job task for '{}' (id={}) to broker",
+                                message.getJobName(), message.getJobId());
+                    } catch (Exception ex) {
+                        log.error("BROKER PUBLISH FAILED for job '{}' (id={}): {}. ",
+                                message.getJobName(), message.getJobId(), ex.getMessage(), ex);
+                    }
+                });
+                
+                log.info("Batch dispatching of {} jobs completed. Time since poll start: {} ms",
+                        messages.size(), Duration.between(now, Instant.now()).toMillis());
             }
         });
     }
