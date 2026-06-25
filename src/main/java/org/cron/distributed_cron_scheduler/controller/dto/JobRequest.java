@@ -10,13 +10,26 @@ import lombok.NoArgsConstructor;
  * Inbound DTO for creating or updating a {@code JobDefinition}.
  *
  * <h3>Scheduling model</h3>
- * <p>Jobs are defined by an <em>anchor time</em> ({@code startHour}:{@code startMinute} IST)
- * and a repeating {@code intervalMinutes}. All execution slots are derived deterministically:
+ * <p>Jobs are scheduled using a standard 5-field Linux cron expression interpreted
+ * in <strong>IST (Asia/Kolkata, UTC+5:30)</strong>.
+ *
+ * <h3>Cron expression format</h3>
  * <pre>
- *   anchor → anchor + interval → anchor + 2×interval → …
+ *   ┌───── minute       (0–59)
+ *   │ ┌─── hour         (0–23)
+ *   │ │ ┌─ day-of-month (1–31)
+ *   │ │ │ ┌ month       (1–12)
+ *   │ │ │ │ ┌ day-of-week (0–7, 0 and 7 = Sunday)
+ *   * * * * *
  * </pre>
- * Example: {@code startHour=10, startMinute=0, intervalMinutes=5}
- * → runs at 10:00, 10:05, 10:10, … 23:55 (IST) every day.
+ *
+ * <h3>Examples</h3>
+ * <ul>
+ *   <li>"&#42;/5 * * * *" &mdash; every 5 minutes</li>
+ *   <li>"0 10 * * 1-5" &mdash; 10:00 AM IST, Monday-Friday</li>
+ *   <li>"30 9 1 * *" &mdash; 09:30 IST on the 1st of every month</li>
+ *   <li>"0 &#42;/2 * * *" &mdash; every 2 hours</li>
+ * </ul>
  */
 @Data
 @Builder
@@ -55,30 +68,12 @@ public class JobRequest {
     private String httpMethod;
 
     /**
-     * IST (India Standard Time) hour of the daily anchor time (0 = midnight, 23 = 11 PM).
-     * Combined with {@link #startMinute} this defines when the first slot fires each day.
+     * Standard 5-field Linux cron expression interpreted in IST.
+     * Must be a valid UNIX cron expression (no seconds field).
+     * Example: every 5 minutes = "&#42;/5 * * * *"
      */
-    @NotNull(message = "Start hour is required")
-    @Min(value = 0,  message = "Start hour must be between 0 and 23")
-    @Max(value = 23, message = "Start hour must be between 0 and 23")
-    private Integer startHour;
-
-    /**
-     * IST (India Standard Time) minute of the daily anchor time (0–59).
-     */
-    @NotNull(message = "Start minute is required")
-    @Min(value = 0,  message = "Start minute must be between 0 and 59")
-    @Max(value = 59, message = "Start minute must be between 0 and 59")
-    private Integer startMinute;
-
-    /**
-     * Recurrence interval in minutes.
-     * Minimum: 1 minute · Maximum: 1440 minutes (24 hours).
-     */
-    @NotNull(message = "Interval in minutes is required")
-    @Min(value = 1,    message = "Interval must be at least 1 minute")
-    @Max(value = 1440, message = "Interval must not exceed 1440 minutes (24 hours)")
-    private Integer intervalMinutes;
+    @NotBlank(message = "Cron expression must not be blank")
+    private String cronExpression;
 
     /**
      * Whether the job should be actively scheduled. Defaults to {@code true}.

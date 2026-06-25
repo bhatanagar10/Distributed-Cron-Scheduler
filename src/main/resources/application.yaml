@@ -36,6 +36,12 @@ spring:
     locations: classpath:db/migration
     baseline-on-migrate: false
 
+  # ── Redis ───────────────────────────────────────────────────────────────────────
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
   # ── RabbitMQ ─────────────────────────────────────────────────────────────────
   rabbitmq:
     host: localhost
@@ -46,15 +52,18 @@ spring:
       simple:
         acknowledge-mode: auto
         prefetch: 1               # Each worker pulls up to 1 messages at once
-        concurrency: 5
-        max-concurrency: 10
+        concurrency: 10
+        max-concurrency: 20
+  output:
+    ansi:
+      enabled: ALWAYS
 
 # ── Custom Scheduler Properties ─────────────────────────────────────────────
 scheduler:
-  poll-interval-ms: 1000          # How often the Manager polls for due jobs (ms)
+  poll-interval-ms: 1000          # How often the Manager polls Redis ZSET for due jobs (ms)
   delay-threshold-ms: 2000        # Default drift threshold for /delays endpoint (ms)
   http-timeout-seconds: 30        # Max wait for an HTTP response from the target
-  batch-size: 10                  # Max jobs locked per polling cycle
+  redis-zset-key: cron:schedule   # Redis ZSET key used as the scheduling index
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging:
@@ -63,3 +72,5 @@ logging:
     org.springframework.amqp: INFO
     org.springframework.web: INFO
     org.hibernate.SQL: WARN
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr([%thread]){cyan} %clr(%-5level) %clr(%logger{36}){yellow} - %msg%n"

@@ -22,14 +22,17 @@ public class JobResponse {
     private String  targetUrl;
     private String  httpMethod;
 
-    /** IST hour (0–23) of the daily anchor time. */
-    private Integer startHour;
+    /**
+     * 5-field Linux cron expression interpreted in IST (Asia/Kolkata).
+     * Example: every 5 minutes = "&#42;/5 * * * *"
+     */
+    private String  cronExpression;
 
-    /** IST minute (0–59) of the daily anchor time. */
-    private Integer startMinute;
-
-    /** Recurrence interval in minutes (1–1440). */
-    private Integer intervalMinutes;
+    /**
+     * Human-readable English description of the cron expression.
+     * Example: "every 5 minutes" or "at 10:00 AM, Monday through Friday".
+     */
+    private String  cronDescription;
 
     private Boolean enabled;
     private Instant nextExecutionTime;

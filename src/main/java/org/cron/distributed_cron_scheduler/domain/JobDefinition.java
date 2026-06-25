@@ -12,19 +12,22 @@ import java.util.UUID;
  * JPA entity representing a row in the {@code job_definitions} table.
  *
  * <h3>Scheduling model</h3>
- * <p>Each job is defined by an <em>anchor time</em> ({@link #startHour}:{@link #startMinute} IST)
- * and a recurrence {@link #intervalMinutes}.  All future execution slots are computed
- * deterministically from the anchor:
+ * <p>Each job is defined by a standard 5-field Linux cron expression (IST timezone):
  * <pre>
- *   slot(n) = anchor + n × intervalMinutes
+ *   ┌───── minute  (0–59)
+ *   │ ┌─── hour    (0–23)
+ *   │ │ ┌─ day-of-month (1–31)
+ *   │ │ │ ┌ month  (1–12)
+ *   │ │ │ │ ┌ day-of-week (0–7, 0 and 7 = Sunday)
+ *   * * * * *
  * </pre>
- * This means scheduling drift (e.g. broker lag) is <em>never</em> accumulated —
- * the next slot is always the smallest {@code slot(n)} that is strictly after {@code now}.
+ * Examples: {@code "*{@literal /}5 * * * *"} = every 5 minutes,
+ *           {@code "0 10 * * 1-5"} = 10:00 AM IST on weekdays.
  *
  * <h3>Concurrency safety</h3>
- * The {@link #nextExecutionTime} column is the primary field used by the Scheduler's locking
- * query ({@code SELECT FOR UPDATE SKIP LOCKED}) to identify due jobs and prevent duplicate
- * dispatch across multiple Manager instances.
+ * The Redis ZSET ({@code cron:schedule}) is the scheduling index. The
+ * {@link #nextExecutionTime} column in Postgres is kept as a fallback cache
+ * used by the startup listener to rebuild the ZSET after a Redis restart.
  */
 @Entity
 @Table(name = "job_definitions")
@@ -60,24 +63,16 @@ public class JobDefinition {
     private String httpMethod;
 
     /**
-     * IST hour component (0–23) of the daily anchor time.
-     * Together with {@link #startMinute} this defines the first execution slot of every day.
+     * Standard 5-field Linux cron expression interpreted in IST (Asia/Kolkata).
+     * Examples:
+     * <ul>
+     *   <li>{@code "*\/5 * * * *"} — every 5 minutes</li>
+     *   <li>{@code "0 10 * * 1-5"} — 10:00 AM IST, Monday–Friday</li>
+     *   <li>{@code "30 9 1 * *"} — 09:30 IST on the 1st of every month</li>
+     * </ul>
      */
-    @Column(name = "start_hour", nullable = false)
-    private Integer startHour;
-
-    /**
-     * IST minute component (0–59) of the daily anchor time.
-     */
-    @Column(name = "start_minute", nullable = false)
-    private Integer startMinute;
-
-    /**
-     * Recurrence interval in minutes (1–1440).
-     * Subsequent slots are anchor + N × intervalMinutes.
-     */
-    @Column(name = "interval_minutes", nullable = false)
-    private Integer intervalMinutes;
+    @Column(name = "cron_expression", nullable = false, length = 100)
+    private String cronExpression;
 
     /**
      * When {@code false}, the Scheduler's poller will skip this job entirely.
