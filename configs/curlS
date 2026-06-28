@@ -1,0 +1,8 @@
+curl --location 'http://localhost:8080/api/jobs' \
+--header 'Content-Type: application/json' \
+--data '{
+    "name": "Test Job 20",
+    "targetUrl": "https://3a0cf2fc-7b2c-470d-90d6-f1bea4265731.mock.pstmn.io/test",
+    "httpMethod": "GET",
+    "cronExpression": "*/1 * * * *"
+}'

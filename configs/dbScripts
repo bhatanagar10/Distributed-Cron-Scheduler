@@ -1,0 +1,29 @@
+ALTER DATABASE crondb SET timezone TO 'Asia/Kolkata';
+show timezone;
+SET TIME ZONE 'Asia/Kolkata';
+
+SELECT
+    ((rn - 1) / 100) + 1 AS batch,
+    MIN(rn) AS row_start,
+    MAX(rn) AS row_end,
+
+    MIN(delay_ms) AS min_delay_ms,
+    MAX(delay_ms) AS max_delay_ms,
+    AVG(delay_ms) AS avg_delay_ms,
+
+    percentile_cont(0.50) WITHIN GROUP (ORDER BY delay_ms) AS p50,
+    percentile_cont(0.70) WITHIN GROUP (ORDER BY delay_ms) AS p70,
+    percentile_cont(0.80) WITHIN GROUP (ORDER BY delay_ms) AS p80,
+    percentile_cont(0.90) WITHIN GROUP (ORDER BY delay_ms) AS p90,
+    percentile_cont(0.99) WITHIN GROUP (ORDER BY delay_ms) AS p99
+
+FROM (
+    SELECT
+        delay_ms, actual_start_time,
+        ROW_NUMBER() OVER (ORDER BY scheduled_time DESC) AS rn
+    FROM job_execution_history
+) t
+GROUP BY ((rn - 1) / 100)
+ORDER BY batch;
+
+ZRANGE cron:schedule 0 -1 WITHSCORES

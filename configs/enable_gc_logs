@@ -1,0 +1,7 @@
+Under Run Configurations, you can enable GC (Garbage Collection) logs by adding the following JVM options to your application's run configuration:
+1. Open your IDE (e.g., IntelliJ IDEA, Eclipse).
+2. Navigate to the Run/Debug Configurations for your application.
+3. Locate the section for VM options or JVM arguments.
+4. Add the following options to enable GC logging:
+
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=20M

@@ -62,11 +62,11 @@ public class JobExecutionWorker {
      */
     @RabbitListener(queues = RabbitMQConfig.QUEUE_NAME)
     public void executeJob(JobTaskMessage message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long tag) {
-        Instant actualStartTime = Instant.now();
+        Instant workerStartTime = Instant.now();
 
-        log.info("Worker received job '{}' (id={}): scheduled={}, actual={}",
+        log.info("Worker received job '{}' (id={}): scheduled={}, worker_start={}",
                 message.getJobName(), message.getJobId(),
-                message.getScheduledTime(), actualStartTime);
+                message.getScheduledTime(), workerStartTime);
 
         // 1. Offload DB read (blocking) to elastic scheduler
         Mono.fromCallable(() -> jobDefinitionRepository.findById(message.getJobId()).orElse(null))
@@ -77,15 +77,18 @@ public class JobExecutionWorker {
                         return Mono.empty(); // Still acks the message
                     }
 
+                    // Capture the exact moment the API call begins
+                    Instant apiStartTime = Instant.now();
+
                     // 2. Non-blocking HTTP call on Netty threads
                     return webClient.method(HttpMethod.valueOf(message.getHttpMethod()))
                             .uri(message.getTargetUrl())
                             .exchangeToMono(clientResponse -> clientResponse.toEntity(String.class))
                             .timeout(Duration.ofSeconds(httpTimeoutSeconds))
-                            .map(response -> buildResult(response, null, actualStartTime, message))
-                            .onErrorResume(ex -> Mono.just(buildResult(null, ex, actualStartTime, message)))
+                            .map(response -> buildResult(response, null, apiStartTime, message))
+                            .onErrorResume(ex -> Mono.just(buildResult(null, ex, apiStartTime, message)))
                             // 3. Offload DB write (blocking) back to elastic scheduler
-                            .flatMap(result -> persistHistoryReactive(jobDef, message.getScheduledTime(), actualStartTime, result));
+                            .flatMap(result -> persistHistoryReactive(jobDef, message.getScheduledTime(), apiStartTime, result));
                 })
                 // 4. Manually ACK the message regardless of success or failure in the pipeline
                 .doFinally(signalType -> ackMessage(channel, tag, message.getJobId()))
