@@ -1,5 +1,6 @@
 package org.cron.distributed_cron_scheduler.worker;
 
+import com.rabbitmq.client.Channel;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.cron.distributed_cron_scheduler.domain.JobDefinition;
@@ -10,44 +11,36 @@ import org.cron.distributed_cron_scheduler.messaging.RabbitMQConfig;
 import org.cron.distributed_cron_scheduler.repository.JobDefinitionRepository;
 import org.cron.distributed_cron_scheduler.repository.JobExecutionHistoryRepository;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.support.AmqpHeaders;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
-import org.springframework.http.HttpMethod;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.TimeoutException;
 
 /**
  * The Execution Engine (Worker) — consumes {@link JobTaskMessage} objects from RabbitMQ
  * and executes the corresponding HTTP call against the target URL.
  *
- * <h3>Execution flow</h3>
+ * <h3>Execution flow (Reactive)</h3>
  * <ol>
- *   <li>Message arrives from the {@code cron.jobs} queue.</li>
- *   <li>{@link #actualStartTime} is captured immediately — this is used to compute
- *       scheduling drift together with {@link JobTaskMessage#getScheduledTime()}.</li>
- *   <li>A non-blocking {@link WebClient} call is issued with a configurable response
- *       timeout ({@code scheduler.http-timeout-seconds}).</li>
- *   <li>Regardless of outcome (SUCCESS / FAILED / TIMEOUT), an immutable
- *       {@link JobExecutionHistory} record is written to the database.</li>
+ *   <li>Message arrives from the {@code cron.jobs} queue along with its delivery tag.</li>
+ *   <li>{@link #actualStartTime} is captured immediately for accurate drift measurement.</li>
+ *   <li>A non-blocking {@link WebClient} call is initiated. The method returns immediately,
+ *       freeing the RabbitMQ listener thread to pick up more messages.</li>
+ *   <li>When the HTTP call completes (success, timeout, or error), the pipeline switches
+ *       to a bounded elastic thread pool to execute the blocking JPA database write.</li>
+ *   <li>Finally, the message is manually acknowledged to RabbitMQ.</li>
  * </ol>
- *
- * <h3>Robustness</h3>
- * <ul>
- *   <li>Network errors ({@link WebClientRequestException}) → status {@code FAILED}</li>
- *   <li>Timeout ({@link java.util.concurrent.TimeoutException}) → status {@code TIMEOUT}</li>
- *   <li>Non-2xx HTTP responses → status {@code FAILED} (HTTP status code is still recorded)</li>
- *   <li>Any unexpected exception → status {@code FAILED}, full message in {@code response_payload}</li>
- * </ul>
- *
- * <h3>Horizontal scaling</h3>
- * Multiple Worker instances may listen on the same queue simultaneously.
- * RabbitMQ distributes messages in round-robin across all connected consumers.
- * Concurrency and prefetch are tuned via {@code spring.rabbitmq.listener.simple.*}
- * in {@code application.yaml}.
  */
 @Component
 @Slf4j
@@ -56,142 +49,111 @@ public class JobExecutionWorker {
 
     private static final int MAX_PAYLOAD_LENGTH = 10_000; // 10 KB cap for stored response body
 
-    private final JobDefinitionRepository    jobDefinitionRepository;
+    private final JobDefinitionRepository jobDefinitionRepository;
     private final JobExecutionHistoryRepository historyRepository;
-    private final WebClient                  webClient;
+    private final WebClient webClient;
 
     @Value("${scheduler.http-timeout-seconds:30}")
     private long httpTimeoutSeconds;
 
     /**
      * Main consumer method — invoked by Spring AMQP whenever a message arrives
-     * on the {@code cron.jobs} queue.
-     *
-     * @param message the task dispatched by the Scheduler containing target URL,
-     *                HTTP method, and scheduled timestamp
+     * on the {@code cron.jobs} queue. Uses manual acknowledgement.
      */
     @RabbitListener(queues = RabbitMQConfig.QUEUE_NAME)
-    public void executeJob(JobTaskMessage message) {
-
-        // Capture the actual start time immediately for accurate drift measurement
+    public void executeJob(JobTaskMessage message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long tag) {
         Instant actualStartTime = Instant.now();
 
         log.info("Worker received job '{}' (id={}): scheduled={}, actual={}",
                 message.getJobName(), message.getJobId(),
                 message.getScheduledTime(), actualStartTime);
 
-        // Look up the parent entity (needed for the FK in job_execution_history)
-        JobDefinition jobDef = jobDefinitionRepository.findById(message.getJobId()).orElse(null);
-        if (jobDef == null) {
-            log.warn("Job {} no longer exists in DB — skipping execution (was it deleted?)",
-                    message.getJobId());
-            return;   // ACK the message; no point in requeing a deleted job
-        }
+        // 1. Offload DB read (blocking) to elastic scheduler
+        Mono.fromCallable(() -> jobDefinitionRepository.findById(message.getJobId()).orElse(null))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(jobDef -> {
+                    if (jobDef == null) {
+                        log.warn("Job {} no longer exists in DB — skipping execution", message.getJobId());
+                        return Mono.empty(); // Still acks the message
+                    }
 
-        // ── Execute the HTTP call and classify the outcome ───────────────────
-        ExecutionStatus status;
-        Integer         httpStatusCode  = null;
-        String          responsePayload;
+                    // 2. Non-blocking HTTP call on Netty threads
+                    return webClient.method(HttpMethod.valueOf(message.getHttpMethod()))
+                            .uri(message.getTargetUrl())
+                            .exchangeToMono(clientResponse -> clientResponse.toEntity(String.class))
+                            .timeout(Duration.ofSeconds(httpTimeoutSeconds))
+                            .map(response -> buildResult(response, null, actualStartTime, message))
+                            .onErrorResume(ex -> Mono.just(buildResult(null, ex, actualStartTime, message)))
+                            // 3. Offload DB write (blocking) back to elastic scheduler
+                            .flatMap(result -> persistHistoryReactive(jobDef, message.getScheduledTime(), actualStartTime, result));
+                })
+                // 4. Manually ACK the message regardless of success or failure in the pipeline
+                .doFinally(signalType -> ackMessage(channel, tag, message.getJobId()))
+                .subscribe();
+    }
 
-        try {
-            ResponseEntity<String> response = webClient
-                    .method(HttpMethod.valueOf(message.getHttpMethod()))
-                    .uri(message.getTargetUrl())
-                    // exchangeToMono: does NOT throw for 4xx/5xx — gives us full response
-                    .exchangeToMono(clientResponse -> clientResponse.toEntity(String.class))
-                    .timeout(Duration.ofSeconds(httpTimeoutSeconds))
-                    .block();
+    private ExecutionResult buildResult(ResponseEntity<String> response, Throwable ex, Instant actualStartTime, JobTaskMessage message) {
+        log.info("API response completed in {} ms", Duration.between(actualStartTime, Instant.now()).toMillis());
 
-            log.info("API response completed in {} ms " , Duration.between(actualStartTime, Instant.now()).toMillis());
-            if (response != null) {
-                httpStatusCode  = response.getStatusCode().value();
-                responsePayload = truncate(response.getBody());
-                status = response.getStatusCode().is2xxSuccessful()
-                        ? ExecutionStatus.SUCCESS
-                        : ExecutionStatus.FAILED;
-
-                log.info("Job '{}' completed: HTTP {}, status={}",
-                        message.getJobName(), httpStatusCode, status);
+        if (ex != null) {
+            if (ex instanceof WebClientRequestException) {
+                log.error("Job '{}' (id={}) — network error: {}", message.getJobName(), message.getJobId(), ex.getMessage());
+                return new ExecutionResult(ExecutionStatus.FAILED, null, "Network error: " + ex.getMessage());
+            } else if (isTimeout(ex)) {
+                log.warn("Job '{}' (id={}) — timed out after {}s", message.getJobName(), message.getJobId(), httpTimeoutSeconds);
+                return new ExecutionResult(ExecutionStatus.TIMEOUT, null, "Request timed out after " + httpTimeoutSeconds + " seconds");
             } else {
-                // Shouldn't happen with exchangeToMono, but guard defensively
-                status          = ExecutionStatus.FAILED;
-                responsePayload = "No response received";
-            }
-
-        } catch (WebClientRequestException ex) {
-            // Connection refused, DNS failure, etc.
-            log.error("Job '{}' (id={}) — network error: {}",
-                    message.getJobName(), message.getJobId(), ex.getMessage());
-            status          = ExecutionStatus.FAILED;
-            responsePayload = "Network error: " + ex.getMessage();
-
-        } catch (Exception ex) {
-            // Covers Reactor timeout (TimeoutException wrapped in a RuntimeException),
-            // and any other unexpected failures
-            if (isTimeout(ex)) {
-                log.warn("Job '{}' (id={}) — timed out after {}s",
-                        message.getJobName(), message.getJobId(), httpTimeoutSeconds);
-                status          = ExecutionStatus.TIMEOUT;
-                responsePayload = "Request timed out after " + httpTimeoutSeconds + " seconds";
-            } else {
-                log.error("Job '{}' (id={}) — unexpected error: {}",
-                        message.getJobName(), message.getJobId(), ex.getMessage(), ex);
-                status          = ExecutionStatus.FAILED;
-                responsePayload = truncate("Unexpected error: " + ex.getMessage());
+                log.error("Job '{}' (id={}) — unexpected error: {}", message.getJobName(), message.getJobId(), ex.getMessage(), ex);
+                return new ExecutionResult(ExecutionStatus.FAILED, null, truncate("Unexpected error: " + ex.getMessage()));
             }
         }
 
-        // ── Persist the execution record ─────────────────────────────────────
-        persistHistory(jobDef, message.getScheduledTime(), actualStartTime,
-                status, httpStatusCode, responsePayload);
+        if (response != null) {
+            int httpStatusCode = response.getStatusCode().value();
+            String responsePayload = truncate(response.getBody());
+            ExecutionStatus status = response.getStatusCode().is2xxSuccessful() ? ExecutionStatus.SUCCESS : ExecutionStatus.FAILED;
+            log.info("Job '{}' completed: HTTP {}, status={}", message.getJobName(), httpStatusCode, status);
+            return new ExecutionResult(status, httpStatusCode, responsePayload);
+        }
+
+        return new ExecutionResult(ExecutionStatus.FAILED, null, "No response received");
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
+    private Mono<Void> persistHistoryReactive(JobDefinition job, Instant scheduledTime, Instant actualStartTime, ExecutionResult result) {
+        return Mono.fromRunnable(() -> {
+            try {
+                JobExecutionHistory history = JobExecutionHistory.builder()
+                        .job(job)
+                        .scheduledTime(scheduledTime)
+                        .actualStartTime(actualStartTime)
+                        .status(result.status())
+                        .httpStatusCode(result.httpStatusCode())
+                        .responsePayload(result.responsePayload())
+                        .build();
 
-    /**
-     * Writes an immutable {@link JobExecutionHistory} row.
-     * The {@code delay_ms} column is computed by PostgreSQL; we only supply raw timestamps.
-     */
-    private void persistHistory(JobDefinition job,
-                                Instant scheduledTime,
-                                Instant actualStartTime,
-                                ExecutionStatus status,
-                                Integer httpStatusCode,
-                                String responsePayload) {
+                historyRepository.save(history);
+                log.debug("Execution history recorded for job '{}': status={}, delay={}ms",
+                        job.getName(), result.status(), Duration.between(scheduledTime, actualStartTime).toMillis());
+            } catch (Exception ex) {
+                log.error("CRITICAL: failed to persist execution history for job '{}' (id={}): {}",
+                        job.getName(), job.getId(), ex.getMessage(), ex);
+            }
+        }).subscribeOn(Schedulers.boundedElastic()).then();
+    }
+
+    private void ackMessage(Channel channel, long tag, java.util.UUID jobId) {
         try {
-            JobExecutionHistory history = JobExecutionHistory.builder()
-                    .job(job)
-                    .scheduledTime(scheduledTime)
-                    .actualStartTime(actualStartTime)
-                    .status(status)
-                    .httpStatusCode(httpStatusCode)
-                    .responsePayload(responsePayload)
-                    .build();
-
-            historyRepository.save(history);
-
-            log.debug("Execution history recorded for job '{}': status={}, delay={}ms",
-                    job.getName(), status,
-                    Duration.between(scheduledTime, actualStartTime).toMillis());
-
-        } catch (Exception ex) {
-            // History persistence failure must not cause message requeue
-            // (which would trigger re-execution of the HTTP call)
-            log.error("CRITICAL: failed to persist execution history for job '{}' (id={}): {}",
-                    job.getName(), job.getId(), ex.getMessage(), ex);
+            channel.basicAck(tag, false);
+            log.debug("Acknowledged message for job {}", jobId);
+        } catch (IOException e) {
+            log.error("Failed to acknowledge message for job {}", jobId, e);
         }
     }
 
-    /**
-     * Checks whether an exception (or its cause chain) is a timeout.
-     * Reactor wraps {@link java.util.concurrent.TimeoutException} in a RuntimeException
-     * when using {@code .block()}.
-     */
-    private boolean isTimeout(Exception ex) {
+    private boolean isTimeout(Throwable ex) {
         Throwable cause = ex;
         while (cause != null) {
-            if (cause instanceof java.util.concurrent.TimeoutException
-                    || cause.getClass().getSimpleName().contains("TimeoutException")) {
+            if (cause instanceof TimeoutException || cause.getClass().getSimpleName().contains("TimeoutException")) {
                 return true;
             }
             cause = cause.getCause();
@@ -199,14 +161,12 @@ public class JobExecutionWorker {
         return false;
     }
 
-    /**
-     * Truncates the response payload to {@link #MAX_PAYLOAD_LENGTH} characters
-     * to prevent oversized rows in the history table.
-     */
     private String truncate(String value) {
         if (value == null) return null;
         return value.length() > MAX_PAYLOAD_LENGTH
                 ? value.substring(0, MAX_PAYLOAD_LENGTH) + "...[truncated]"
                 : value;
     }
+
+    private record ExecutionResult(ExecutionStatus status, Integer httpStatusCode, String responsePayload) {}
 }

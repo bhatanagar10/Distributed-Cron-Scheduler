@@ -50,7 +50,7 @@ spring:
     password: guest
     listener:
       simple:
-        acknowledge-mode: auto
+        acknowledge-mode: manual
         prefetch: 2               # Each worker pulls up to 1 messages at once
         concurrency: 60
         max-concurrency: 70
