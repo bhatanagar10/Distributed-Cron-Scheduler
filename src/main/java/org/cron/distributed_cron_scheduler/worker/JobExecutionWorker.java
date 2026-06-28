@@ -102,6 +102,7 @@ public class JobExecutionWorker {
                     .timeout(Duration.ofSeconds(httpTimeoutSeconds))
                     .block();
 
+            log.info("API response completed in {} ms " , Duration.between(actualStartTime, Instant.now()).toMillis());
             if (response != null) {
                 httpStatusCode  = response.getStatusCode().value();
                 responsePayload = truncate(response.getBody());

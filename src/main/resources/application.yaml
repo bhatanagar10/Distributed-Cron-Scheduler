@@ -51,9 +51,9 @@ spring:
     listener:
       simple:
         acknowledge-mode: auto
-        prefetch: 1               # Each worker pulls up to 1 messages at once
-        concurrency: 10
-        max-concurrency: 20
+        prefetch: 2               # Each worker pulls up to 1 messages at once
+        concurrency: 60
+        max-concurrency: 70
   output:
     ansi:
       enabled: ALWAYS
